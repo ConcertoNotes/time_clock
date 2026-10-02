@@ -1,8 +1,8 @@
 /**
  * Electron 主进程
- * 负责：无边框透明窗口、置顶、窗口位置/尺寸记忆、右键菜单、开机自启、IPC 通信
+ * 负责：无边框透明窗口、置顶、窗口位置/尺寸记忆、右键菜单、系统托盘、开机自启、IPC 通信
  */
-const { app, BrowserWindow, ipcMain, Menu, screen } = require('electron')
+const { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, screen } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
 
@@ -15,11 +15,15 @@ if (isDev) app.setPath('userData', path.join(app.getPath('appData'), 'FlipClock-
 // 默认窗口尺寸（与渲染进程 src/lib/layout.ts 中的基准保持一致：37rem x 15.625rem @16px）
 const DEFAULT_SIZE = { width: 592, height: 250 }
 const STATE_FILE = path.join(app.getPath('userData'), 'window-state.json')
+// 应用图标：打包时通过 package.json 的 build.files 显式包含 build/icon.png，供窗口与托盘使用
+const ICON_PATH = path.join(__dirname, '..', 'build', 'icon.png')
 // 开机自启仅 Windows / macOS 支持，且只在打包后的应用中启用，避免把 electron.exe 注册进启动项
 const loginItemSupported = app.isPackaged && ['win32', 'darwin'].includes(process.platform)
 
 /** @type {BrowserWindow | null} */
 let win = null
+/** 托盘实例需保持全局引用，否则会被垃圾回收导致图标消失 @type {Tray | null} */
+let tray = null
 
 /* ------------------------------------------------------------------ */
 /* 窗口状态持久化                                                       */
@@ -79,6 +83,7 @@ function getPublicState() {
 /** 主进程侧状态变化（例如在右键菜单里切换置顶）时通知渲染进程 */
 function broadcastState() {
   if (win && !win.isDestroyed()) win.webContents.send('win:state', getPublicState())
+  refreshTrayMenu()
 }
 
 function setAlwaysOnTop(flag) {
@@ -96,8 +101,22 @@ function resetPosition() {
   win.setPosition(x, y)
 }
 
-function buildContextMenu() {
-  const template = [
+/** 显示并聚焦窗口（托盘点击、再次启动应用时使用） */
+function showWindow() {
+  if (!win) return
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+}
+
+/** 隐藏到托盘：窗口不在任务栏显示，最小化后无处恢复，因此一律改为隐藏 */
+function hideWindow() {
+  win?.hide()
+}
+
+/** 右键菜单与托盘菜单共用的设置项 */
+function settingItems() {
+  return [
     {
       label: '窗口置顶',
       type: 'checkbox',
@@ -116,13 +135,56 @@ function buildContextMenu() {
     },
     { type: 'separator' },
     { label: '重置位置', click: resetPosition },
-    { label: '最小化', click: () => win?.minimize() },
   ]
+}
+
+function buildContextMenu() {
+  const template = [...settingItems(), { label: '隐藏到托盘', click: hideWindow }]
   if (isDev) {
     template.push({ label: '开发者工具', click: () => win?.webContents.toggleDevTools() })
   }
   template.push({ type: 'separator' }, { label: '退出 FlipClock', click: () => app.quit() })
   return Menu.buildFromTemplate(template)
+}
+
+/* ------------------------------------------------------------------ */
+/* 系统托盘：程序不占任务栏，常驻托盘区                                   */
+/* ------------------------------------------------------------------ */
+
+/** 由 512px 应用图标生成多倍率托盘图标，保证高 DPI 下清晰 */
+function createTrayIcon() {
+  const source = nativeImage.createFromPath(ICON_PATH)
+  if (source.isEmpty()) return source
+  const icon = nativeImage.createEmpty()
+  for (const scaleFactor of [1, 1.25, 1.5, 2]) {
+    const size = Math.round(16 * scaleFactor)
+    icon.addRepresentation({
+      scaleFactor,
+      dataURL: source.resize({ width: size, height: size, quality: 'best' }).toDataURL(),
+    })
+  }
+  return icon
+}
+
+function refreshTrayMenu() {
+  if (!tray || tray.isDestroyed()) return
+  const visible = Boolean(win?.isVisible())
+  const template = [
+    { label: visible ? '隐藏时钟' : '显示时钟', click: () => (visible ? hideWindow() : showWindow()) },
+    { type: 'separator' },
+    ...settingItems(),
+    { type: 'separator' },
+    { label: '退出 FlipClock', click: () => app.quit() },
+  ]
+  tray.setContextMenu(Menu.buildFromTemplate(template))
+}
+
+function createTray() {
+  tray = new Tray(createTrayIcon())
+  tray.setToolTip('FlipClock')
+  // 左键单击：切换时钟的显示 / 隐藏；右键弹出托盘菜单
+  tray.on('click', () => (win?.isVisible() ? hideWindow() : showWindow()))
+  refreshTrayMenu()
 }
 
 function createWindow() {
@@ -133,8 +195,6 @@ function createWindow() {
     ;({ x, y } = defaultPosition(width))
   }
 
-  const iconPath = path.join(__dirname, '..', 'build', 'icon.png')
-
   win = new BrowserWindow({
     x,
     y,
@@ -142,7 +202,8 @@ function createWindow() {
     height,
     show: false,
     title: 'FlipClock',
-    icon: fs.existsSync(iconPath) ? iconPath : undefined,
+    icon: fs.existsSync(ICON_PATH) ? ICON_PATH : undefined,
+    skipTaskbar: true, // 不在任务栏显示，程序常驻系统托盘
     // —— 桌面摆件的核心窗口特性 ——
     frame: false, // 无边框
     transparent: true, // 透明背景，配合 CSS 实现圆角玻璃面板
@@ -177,6 +238,9 @@ function createWindow() {
   win.on('resized', persistBounds)
   // 兜底：拖拽过程中窗口失焦（如 Alt+Tab）时结束拖拽，避免窗口一直跟随光标
   win.on('blur', stopDrag)
+  // 显示 / 隐藏时同步托盘菜单中的“显示时钟 / 隐藏时钟”文案
+  win.on('show', refreshTrayMenu)
+  win.on('hide', refreshTrayMenu)
 
   // 安全加固：禁止打开新窗口与页面跳转
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
@@ -215,6 +279,7 @@ ipcMain.handle('win:set-always-on-top', (_e, flag) => {
 
 ipcMain.handle('app:set-open-at-login', (_e, flag) => {
   if (loginItemSupported) app.setLoginItemSettings({ openAtLogin: Boolean(flag) })
+  refreshTrayMenu()
   return getPublicState()
 })
 
@@ -264,7 +329,7 @@ ipcMain.on('win:drag-start', () => {
 
 ipcMain.on('win:drag-end', stopDrag)
 
-ipcMain.on('win:minimize', () => win?.minimize())
+ipcMain.on('win:minimize', hideWindow)
 ipcMain.on('win:close', () => win?.close())
 ipcMain.on('win:context-menu', () => {
   if (win) buildContextMenu().popup({ window: win })
@@ -278,16 +343,14 @@ ipcMain.on('win:context-menu', () => {
 if (!app.requestSingleInstanceLock()) {
   app.quit()
 } else {
-  app.on('second-instance', () => {
-    if (!win) return
-    if (win.isMinimized()) win.restore()
-    win.show()
-    win.focus()
-  })
+  app.on('second-instance', showWindow)
 
   app.whenReady().then(() => {
     Menu.setApplicationMenu(null)
+    // macOS：隐藏 Dock 图标，与 Windows 的“不占任务栏”保持一致
+    app.dock?.hide()
     createWindow()
+    createTray()
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow()

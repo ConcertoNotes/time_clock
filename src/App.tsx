@@ -176,7 +176,7 @@ export default function App() {
             </button>
             {isDesktop && (
               <>
-                <button className="icon-btn" title="最小化" onClick={() => desktopApi?.minimize()}>
+                <button className="icon-btn" title="隐藏到托盘" onClick={() => desktopApi?.minimize()}>
                   <Minus />
                 </button>
                 <button className="icon-btn" data-danger title="关闭" onClick={() => desktopApi?.close()}>

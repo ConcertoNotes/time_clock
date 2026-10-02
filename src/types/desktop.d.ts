@@ -15,6 +15,7 @@ export interface DesktopApi {
   setSize(width: number, height: number): void
   dragStart(): void
   dragEnd(): void
+  /** 隐藏到系统托盘 */
   minimize(): void
   close(): void
   showContextMenu(): void

@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('desktop', {
   /** 开始 / 结束拖拽窗口（主进程跟随光标移动窗口） */
   dragStart: () => ipcRenderer.send('win:drag-start'),
   dragEnd: () => ipcRenderer.send('win:drag-end'),
+  /** 隐藏到系统托盘（窗口不占任务栏，无法最小化到任务栏） */
   minimize: () => ipcRenderer.send('win:minimize'),
   close: () => ipcRenderer.send('win:close'),
   /** 弹出原生右键菜单 */
